@@ -71,7 +71,7 @@ class ClaudeBreederTests(unittest.TestCase):
         roles = [p.role for p in lg.prophets]
         self.assertEqual(len(roles), LEAGUE_SIZE)
         self.assertEqual(roles.count("CLAUDE"), 3)
-        self.assertEqual(roles.count("MUTANT"), 1)
+        self.assertEqual(roles.count("MUTANT"), LEAGUE_SIZE - 5)
         self.assertEqual(roles.count("CROSSOVER"), 1)
         self.assertTrue(all(p.note for p in lg.prophets if p.role == "CLAUDE"))
 

@@ -82,6 +82,66 @@ def playbook(node: gp.Node, fs: FeatureSet, label: np.ndarray, valid: np.ndarray
     return out
 
 
+# --------------------------------------------------------------------------- #
+# CONFIDENCE - how sure is the prophet about THIS call?
+# --------------------------------------------------------------------------- #
+TIERS = (("HIGH", 0.60), ("MEDIUM", 0.54), ("LOW", 0.0))
+
+
+def tier(conf: float) -> str:
+    return next(name for name, floor in TIERS if conf >= floor)
+
+
+class ConfidenceTable:
+    """
+    Every call is made for a reason - a particular combination of the rule's conditions being
+    true or false. The confidence of a call is how often calls made for exactly that reason were
+    right over the past `days` days (answers already known before day t). Rare combinations
+    (fewer than `min_cases`) fall back to the rule's overall hit rate for that answer.
+    """
+
+    MAX_LEAVES = 12
+
+    def __init__(self, tree: gp.Node, fs: FeatureSet, label: np.ndarray, valid: np.ndarray, t: int,
+                 days: int = 250, min_cases: int = 100) -> None:
+        self.tree = tree
+        uniq = {}
+        for c in gp.leaves(tree):
+            uniq.setdefault(gp.key(c), c)
+        self.leaves = list(uniq.values())[:self.MAX_LEAVES]
+        a = max(0, t - days)
+        ev = gp.TreeEvaluator(fs, a, t)
+        pred = ev(tree).astype(bool)
+        ok = valid[:, a:t]
+        right = pred == label[:, a:t]
+        self.fallback = {True: _mean(right[ok & pred]), False: _mean(right[ok & ~pred])}
+        size = 1 << len(self.leaves)
+        sig = self._signature(ev)[ok]
+        n = np.bincount(sig, minlength=size).astype(float)
+        hits = np.bincount(sig, weights=right[ok].astype(float), minlength=size)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            self.table = np.where(n >= min_cases, hits / n, np.nan)
+        self.cases = n
+
+    def _signature(self, ev: gp.TreeEvaluator) -> np.ndarray:
+        sig = np.zeros(ev(self.leaves[0]).shape, dtype=np.int64)
+        for i, c in enumerate(self.leaves):
+            sig |= ev.leaf(c).astype(np.int64) << i
+        return sig
+
+    def calls(self, fs: FeatureSet, t: int) -> tuple[np.ndarray, np.ndarray]:
+        """(call, confidence) for every stock on day t."""
+        ev = gp.TreeEvaluator(fs, t, t + 1)
+        pred = ev(self.tree)[:, 0].astype(bool)
+        conf = self.table[self._signature(ev)[:, 0]]
+        fb = np.where(pred, self.fallback[True], self.fallback[False])
+        return pred, np.where(np.isfinite(conf), conf, fb)
+
+
+def _mean(x: np.ndarray) -> float:
+    return float(x.mean()) if x.size else 0.5
+
+
 def sample_reasons(node: gp.Node, fs: FeatureSet, symbols: list[str], t: int, k: int = 6) -> list[tuple[str, bool, list[str]]]:
     """A few stocks with their call and reason: YES calls first (the interesting ones), then some NO calls."""
     calls = [(sym, *reason(node, fs, s, t)) for s, sym in enumerate(symbols)]

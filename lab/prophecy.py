@@ -44,7 +44,16 @@ from lab.features import FeatureSet
 from lab.forecast import DAILY_BINARY, DAILY_NAMES, PLAIN, TARGETS, WARMUP_DAYS, Answers, textbook_tree
 
 ROUND_DAYS = 5
-LEAGUE_SIZE = 6
+# 1 Alpha + (LEAGUE_SIZE - 1) children per generation. More children = more new ideas tried each week;
+# still only ONE survivor.
+LEAGUE_SIZE = int(os.getenv("PROPHECY_LEAGUE_SIZE", "20"))
+# COUNCIL OF ANCESTORS: every dethroned Alpha is kept in a Hall of Fame (the best HALL_SIZE by length
+# of reign). Each generation the ancestor that would have scored best on the judging window is
+# summoned to compete; if it wins, it returns as Alpha. When the market goes back to a kind of
+# regime the bots have seen before, the league can remember instead of re-learning from scratch.
+HALL_SIZE = int(os.getenv("PROPHECY_HALL_SIZE", "20"))
+# Senses evolution may not pick (comma-separated; for experiments)
+HIDDEN_SENSES = frozenset(x for x in os.getenv("PROPHECY_HIDDEN_SENSES", "").split(",") if x)
 # One week is noisy: a lucky week would crown a worse rule and throw a good one away.
 # So the crown is decided on the last JUDGE_DAYS days of already-known answers (every prophet
 # is scored on the same days, even ones born this week), and a challenger must beat the Alpha
@@ -78,6 +87,7 @@ class Prophet:
     life_correct: int = 0       # whole life
     life_total: int = 0
     note: str = ""              # Claude's reason for designing this child (empty for random offspring)
+    reign: int = 0              # generations survived as Alpha
 
     @property
     def accuracy(self) -> float:
@@ -101,6 +111,7 @@ class League:
     alpha_total: int = 0
     naive_correct: int = 0
     naive_total: int = 0
+    hall: list[dict] = field(default_factory=list)      # council of ancestors: {bot_id, tree, reign, until}
 
     @property
     def alpha(self) -> Prophet:
@@ -114,13 +125,21 @@ class League:
 # --------------------------------------------------------------------------- #
 # Founding and reproduction
 # --------------------------------------------------------------------------- #
+def champion_file(target: str) -> Path:
+    return config.LAB_DIR / f"prophecy_champion_{target}.json"
+
+
 def founding_tree(target: str) -> gp.Node:
-    """Start from the Forecaster Arena champion if there is one, else the textbook rule."""
+    """Start from the champion of the latest EVOLVE run, else the Forecaster Arena champion, else the textbook rule."""
+    try:
+        return gp.simplify(gp.from_json(json.loads(champion_file(target).read_text(encoding="utf-8"))["tree"]))
+    except (OSError, ValueError, KeyError):
+        pass
     path = config.LAB_DIR / f"forecast_{target}.json"
     try:
         hall = json.loads(path.read_text(encoding="utf-8")).get("hall") or []
         if hall:
-            return gp.from_json(hall[0]["tree"])
+            return gp.simplify(gp.from_json(hall[0]["tree"]))
     except (OSError, ValueError, KeyError):
         pass
     return textbook_tree(target)
@@ -138,7 +157,7 @@ def found_league(target: str, rng: random.Random, today: str, breeder=None, fres
 
 def _offspring(league: League, alpha: gp.Node, runner_up: gp.Node, rng: random.Random, today: str,
                designed: list[tuple[gp.Node, str]] | None = None) -> list[Prophet]:
-    """Five children: Claude's designs first (if any), then random mutants, and always one crossover.
+    """LEAGUE_SIZE-1 children: Claude's designs first (if any), then random mutants, and always one crossover.
 
     At least one random mutant and the crossover are kept, so Claude's children always race a blind control."""
     kids, seen = [], {gp.key(alpha)}
@@ -151,8 +170,9 @@ def _offspring(league: League, alpha: gp.Node, runner_up: gp.Node, rng: random.R
         kids.append(Prophet(league.new_id(), gp.to_json(tree), parent, today, "CLAUDE", note=why))
     while len(kids) < LEAGUE_SIZE - 1:
         cross = len(kids) == LEAGUE_SIZE - 2
+        strength = (1.0, 0.5, 1.5, 2.5)[len(kids) % 4]      # careful tweaks through bold leaps
         tree = gp.simplify(gp.crossover(alpha, runner_up, rng, MAX_DEPTH) if cross
-                           else gp.mutate(alpha, rng, league.rate, MAX_DEPTH))
+                           else gp.mutate(alpha, rng, min(league.rate * strength, 0.6), MAX_DEPTH))
         for _ in range(5):
             if gp.key(tree) not in seen:
                 break
@@ -180,29 +200,66 @@ def window_scores(league: League, fs: FeatureSet, ans: Answers, t_end: int, days
     answered). Rules are deterministic, so a child born this week can be scored too.
 
     details: if a dict is passed, it's filled with bot_id -> {acc, bold, naive, acc_pts, act_pts, points}."""
-    label, valid = _labels(ans, league.target)
+    return _score_trees(league.target, [(p.bot_id, gp.from_json(p.tree)) for p in league.prophets],
+                        fs, ans, t_end, days, details)
+
+
+def _score_trees(target: str, items: list[tuple[int, gp.Node]], fs: FeatureSet, ans: Answers, t_end: int,
+                 days: int | None = None, details: dict | None = None) -> dict[int, float]:
+    label, valid = _labels(ans, target)
     t0 = max(0, t_end - (days or JUDGE_DAYS) + 1)
     ok = valid[:, t0:t_end + 1]
     lab = label[:, t0:t_end + 1]
     if not ok.any():
         return {}
-    naive = naive_call_for(ans, league.target, t0)          # the naive guess as it was known at the window start
+    naive = naive_call_for(ans, target, t0)                 # the naive guess as it was known at the window start
     naive_acc = float((lab == naive)[ok].mean())
     ev = gp.TreeEvaluator(fs, t0, t_end + 1)
     out = {}
-    for p in league.prophets:
-        pred = ev(gp.from_json(p.tree))
+    for bot_id, tree in items:
+        pred = ev(tree)
         bold = float(pred[ok].mean())
         acc = float((pred == lab)[ok].mean())
         total, acc_pts, act_pts = points(acc, naive_acc, bold)
         # A rule that (almost) always gives the same answer has no reason - it's just the naive guess in
         # disguise. It can't take or keep the crown while any prophet with a real reason is alive.
         reasoned = MIN_CALL_SHARE <= bold <= 1 - MIN_CALL_SHARE
-        out[p.bot_id] = total if reasoned else total - NO_REASON_PENALTY
+        out[bot_id] = total if reasoned else total - NO_REASON_PENALTY
         if details is not None:
-            details[p.bot_id] = {"acc": acc, "bold": bold, "naive": naive_acc, "acc_pts": acc_pts,
+            details[bot_id] = {"acc": acc, "bold": bold, "naive": naive_acc, "acc_pts": acc_pts,
                                  "act_pts": act_pts, "points": total, "reasoned": reasoned}
     return out
+
+
+def summon_ancestor(league: League, fs: FeatureSet, ans: Answers, t_end: int) -> Prophet | None:
+    """Bring the Hall of Fame member that scores best on the judging window into this generation's contest."""
+    present = {gp.key(gp.from_json(p.tree)) for p in league.prophets}
+    candidates = [h for h in league.hall if gp.key(gp.from_json(h["tree"])) not in present]
+    if not candidates:
+        return None
+    scores = _score_trees(league.target, [(i, gp.from_json(h["tree"])) for i, h in enumerate(candidates)],
+                          fs, ans, t_end)
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+    if scores[best] <= -NO_REASON_PENALTY / 2:
+        return None
+    h = candidates[best]
+    ghost = Prophet(h["bot_id"], h["tree"], None, h.get("until", ""), "ANCESTOR", reign=h.get("reign", 0))
+    league.prophets.append(ghost)
+    return ghost
+
+
+def _enshrine(league: League, p: Prophet, today: str) -> None:
+    """Put a dethroned Alpha into the Hall of Fame (keeps the HALL_SIZE longest reigns)."""
+    if HALL_SIZE <= 0:
+        return
+    k = gp.key(gp.from_json(p.tree))
+    league.hall = [h for h in league.hall if gp.key(gp.from_json(h["tree"])) != k]
+    league.hall.append({"bot_id": p.bot_id, "tree": p.tree, "reign": p.reign, "until": today})
+    if len(league.hall) > HALL_SIZE:
+        league.hall.sort(key=lambda h: h["reign"], reverse=True)
+        del league.hall[HALL_SIZE:]
 
 
 def judge_round(league: League, rng: random.Random, today: str, dates: str, breeder=None,
@@ -232,6 +289,8 @@ def judge_round(league: League, rng: random.Random, today: str, dates: str, bree
         "details": {str(k): v for k, v in (details or {}).items()},
     }
     survivor_tree, runner_tree = gp.from_json(survivor.tree), gp.from_json(runner_up.tree)
+    if dethroned:
+        _enshrine(league, alpha, today)
     last_round = [{"accuracy": p.accuracy, "role": p.role, "rule": gp.describe(gp.from_json(p.tree), breeder.fs)}
                   for p in ranked] if breeder is not None else []   # what Claude sees, captured before the purge
     # EXTINCTION: everyone except the survivor is deleted - verified with weak references
@@ -247,10 +306,12 @@ def judge_round(league: League, rng: random.Random, today: str, dates: str, bree
     league.rate = (max(config.MUTATION_RATE_MIN, league.rate * config.MUTATION_PROGRESS_DECAY) if dethroned
                    else min(config.MUTATION_RATE_MAX, league.rate * config.MUTATION_STUCK_BOOST))
     survivor.role = "ALPHA"
+    survivor.reign += 1
     survivor.correct = survivor.total = 0
     designed = breeder.design(league.target, survivor_tree, last_round, league.history) if breeder else None
     league.prophets += _offspring(league, survivor_tree, runner_tree, rng, today, designed)
     record["claude_children"] = sum(p.role == "CLAUDE" for p in league.prophets)
+    record["hall_size"] = len(league.hall)
     for p in league.prophets[1:]:
         p.parent = survivor.bot_id
     league.round_no += 1
@@ -317,6 +378,7 @@ class ReplaySummary:
     ci: tuple[float, float]           # 90% bootstrap interval of (Alpha - naive), percentage points
     chart: str | None = None
     counts: list = field(default_factory=list)   # per day: (alpha correct, naive correct, calls)
+    tiers: dict = field(default_factory=dict)    # confidence tier -> [calls, alpha correct, naive correct]
     fresh: bool = False
     explain: dict = field(default_factory=dict)   # the final Alpha's playbook (see explain_league)
 
@@ -345,16 +407,29 @@ def replay(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, target: str, d
     label, valid = _labels(ans, target)
     if breeder is not None:
         breeder.fs, breeder.ans, breeder.t = fs, ans, start
-    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN, HIDDEN_SENSES):
         league = found_league(target, rng, str(index[start].date()), breeder, fresh)
         display.prophecy_replay_intro(league, index[start].date(), index[end - 1].date(), end - start, fresh=fresh)
+        from lab.explain import TIERS, ConfidenceTable
+
+        TIER_FLOORS = dict(TIERS)
+
         alpha_daily, naive_daily, day_labels = [], [], []
         correct_matrix = []                          # per day: (alpha correct, naive correct, n) for the bootstrap
+        tiers = {name: [0, 0, 0] for name in ("HIGH", "MEDIUM", "LOW")}
+        conf_table = ConfidenceTable(gp.from_json(league.alpha.tree), fs, label, valid, start)
         round_start = start
         for t in range(start, end):
             calls = league_calls(league, fs, t)
             naive = naive_call_for(ans, target, t)
             alpha_id = league.alpha.bot_id
+            _, conf = conf_table.calls(fs, t)          # how sure the Alpha is of each call (from the past only)
+            ok_t = valid[:, t]
+            high = conf >= TIER_FLOORS["HIGH"]
+            for name, m in (("HIGH", ok_t & high), ("MEDIUM", ok_t & ~high & (conf >= TIER_FLOORS["MEDIUM"]))):
+                tiers[name][0] += int(m.sum())
+                tiers[name][1] += int((calls[alpha_id][m] == label[m, t]).sum())
+                tiers[name][2] += int((label[m, t] == naive).sum())
             day_acc = score_day(league, calls, label[:, t], valid[:, t], naive)
             n = int(valid[:, t].sum())
             if n:
@@ -368,20 +443,33 @@ def replay(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, target: str, d
                 if breeder is not None:
                     breeder.t = t + 1          # day t's answer is known at t+1's close, when the next calls are made
                 det: dict = {}
+                summon_ancestor(league, fs, ans, t)
                 rec = judge_round(league, rng, str(index[t].date()),
                                   f"{index[round_start].date()} → {index[t].date()}", breeder,
                                   scores=window_scores(league, fs, ans, t, details=det), judge_days=JUDGE_DAYS,
                                   details=det)
                 display.prophecy_round(league, rec, naive_daily[-ROUND_DAYS:])
                 round_start = t + 1
+                conf_table = ConfidenceTable(gp.from_json(league.alpha.tree), fs, label, valid, t + 1)
     cm = np.array(correct_matrix, dtype=float)
     diff_ci = _bootstrap_ci(cm, rng=np.random.default_rng(seed or 0))
     summary = ReplaySummary(target, league, day_labels, alpha_daily, naive_daily,
                             league.alpha_correct / max(league.alpha_total, 1),
                             league.naive_correct / max(league.naive_total, 1), diff_ci,
                             counts=[tuple(r) for r in correct_matrix], fresh=fresh)
-    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+    total_calls = league.alpha_total
+    tiers["LOW"] = [total_calls - tiers["HIGH"][0] - tiers["MEDIUM"][0],
+                    league.alpha_correct - tiers["HIGH"][1] - tiers["MEDIUM"][1],
+                    league.naive_correct - tiers["HIGH"][2] - tiers["MEDIUM"][2]]
+    summary.tiers = tiers
+    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN, HIDDEN_SENSES):
         summary.explain = explain_league(league, fs, ans, end)
+    if save_chart and len(league.history) >= 100:
+        # a long evolution's final Alpha founds the next LIVE league
+        champion_file(target).write_text(json.dumps({
+            "tree": league.alpha.tree, "bot": league.alpha.bot_id, "generations": len(league.history),
+            "through": str(index[end].date()), "edge_pts": (summary.alpha_accuracy - summary.naive_accuracy) * 100,
+            "features": DAILY_NAMES}, indent=1), encoding="utf-8")
     if save_chart:
         from utils.charts import render_prophecy_report
         out = render_prophecy_report(summary, config.LAB_DIR / f"prophecy_replay_{target}.png")
@@ -392,33 +480,38 @@ def replay(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, target: str, d
 def explain_league(lg: League, fs: FeatureSet, ans: Answers, t: int, symbols: list[str] | None = None,
                    k: int = 6) -> dict:
     """The reigning Alpha's rule, its track record before day t, and (optionally) example calls with reasons."""
-    from lab.explain import playbook, sample_reasons
+    from lab.explain import ConfidenceTable, playbook, reason
 
     label, valid = _labels(ans, lg.target)
     tree = gp.from_json(lg.alpha.tree)
     out = {"bot": lg.alpha.bot_id, "rule": gp.describe(tree, fs), "playbook": playbook(tree, fs, label, valid, t)}
     if symbols:
-        out["samples"] = sample_reasons(tree, fs, symbols, t, k)
+        calls, conf = ConfidenceTable(tree, fs, label, valid, t).calls(fs, t)
+        order = np.argsort(-conf, kind="stable")[:k]        # the calls it is most sure about
+        out["samples"] = [(symbols[s], bool(calls[s]), reason(tree, fs, int(s), t)[1], float(conf[s])) for s in order]
     return out
 
 
-def write_reasons(path: Path, leagues: dict[str, League], fs: FeatureSet, symbols: list[str], t: int, day: str) -> Path:
+def write_reasons(path: Path, leagues: dict[str, League], fs: FeatureSet, ans: Answers, symbols: list[str], t: int,
+                  day: str) -> Path:
     """Every Alpha call for the next day with the exact facts behind it - anyone can check it by hand."""
     import csv
 
-    from lab.explain import reason
+    from lab.explain import ConfidenceTable, reason, tier
     from lab.forecast import TARGETS
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
-        w.writerow(["data_through", "league", "alpha_bot", "stock", "call", "reason"])
+        w.writerow(["data_through", "league", "alpha_bot", "stock", "call", "confidence", "tier", "reason"])
         for target, lg in leagues.items():
             yes, no, _ = TARGETS[target]
             tree = gp.from_json(lg.alpha.tree)
+            _, conf = ConfidenceTable(tree, fs, *_labels(ans, target), t).calls(fs, t)
             for s, sym in enumerate(symbols):
                 hit, why = reason(tree, fs, s, t)
-                w.writerow([day, target, lg.alpha.bot_id, sym, yes if hit else no, " AND ".join(why)])
+                w.writerow([day, target, lg.alpha.bot_id, sym, yes if hit else no, f"{conf[s]:.3f}", tier(conf[s]),
+                            " AND ".join(why)])
     return path
 
 
@@ -483,7 +576,7 @@ def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: li
     state = load_state()
     if breeder is not None:
         breeder.fs, breeder.ans, breeder.t = fs, ans, last
-    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+    with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN, HIDDEN_SENSES):
         upgraded = state is not None and (state.get("symbols") != symbols or state.get("features") != DAILY_NAMES)
         if upgraded:
             # The stock list or the bots' senses changed: old calls can't be scored against the new setup.
@@ -522,6 +615,7 @@ def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: li
                                 "alpha": lg.alpha.bot_id, "up_share": float(label[valid[:, i], i].mean()) if n else 0})
                 if lg.round_days >= ROUND_DAYS:
                     det: dict = {}
+                    summon_ancestor(lg, fs, ans, i)
                     rounds.append((target, judge_round(lg, rng, today, f"round ending {day}", breeder,
                                                        scores=window_scores(lg, fs, ans, i, details=det),
                                                        judge_days=JUDGE_DAYS, details=det)))
@@ -534,7 +628,7 @@ def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: li
                            for t, lg in leagues.items()}
             state["pending"][today] = calls_today
         explanations = {t: explain_league(lg, fs, ans, last, symbols) for t, lg in leagues.items()}
-        reasons_csv = write_reasons(config.LAB_DIR / "prophecy_reasons_latest.csv", leagues, fs, symbols, last, today)
+        reasons_csv = write_reasons(config.LAB_DIR / "prophecy_reasons_latest.csv", leagues, fs, ans, symbols, last, today)
         state["leagues"] = {t: _league_to_json(lg) for t, lg in leagues.items()}
         state["log"].append({"run_at": datetime.now().isoformat(timespec="seconds"), "data_through": today,
                              "revealed": len(reveals), "rounds": len(rounds)})

@@ -115,6 +115,42 @@ class ProphecyTests(unittest.TestCase):
             rec = P.judge_round(lg, rng, "2025-01-15", "t", scores=scores, judge_days=P.JUDGE_DAYS)
             self.assertEqual(rec["survivor"], challenger)
 
+    def test_ancestors_are_kept_and_can_return(self) -> None:
+        rng = random.Random(6)
+        self.fs.fit_quantiles(260, 1200)
+        with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+            lg = P.found_league("volatility", rng, "2025-01-01")
+            lg.alpha.tree = gp.to_json(gp.cond("move_size", True, 0.5))   # a rule with a real reason
+            old_alpha = lg.alpha
+            old_id, old_tree = old_alpha.bot_id, old_alpha.tree
+            del old_alpha
+            scores = {p.bot_id: 0.0 for p in lg.prophets}
+            scores[lg.prophets[1].bot_id] = 5.0                      # the Alpha is dethroned...
+            scores[lg.prophets[2].bot_id] = 4.0                      # (runner-up isn't the old Alpha)
+            P.judge_round(lg, rng, "2025-01-08", "t", scores=scores, judge_days=P.JUDGE_DAYS)
+            self.assertEqual([h["bot_id"] for h in lg.hall], [old_id])   # ...and enshrined
+            ghost = P.summon_ancestor(lg, self.fs, self.ans, 1500)
+            self.assertIsNotNone(ghost)
+            self.assertEqual((ghost.bot_id, ghost.tree, ghost.role), (old_id, old_tree, "ANCESTOR"))
+            scores = {p.bot_id: 0.0 for p in lg.prophets}
+            scores[old_id] = 9.0                                     # the ancestor fits the market best
+            del ghost
+            rec = P.judge_round(lg, rng, "2025-01-15", "t", scores=scores, judge_days=P.JUDGE_DAYS)
+            self.assertEqual((rec["survivor"], rec["survivor_role"]), (old_id, "ANCESTOR"))
+            self.assertEqual(lg.alpha.bot_id, old_id)
+            self.assertEqual(len(lg.prophets), P.LEAGUE_SIZE)
+
+    def test_confidence_matches_the_rule(self) -> None:
+        from lab.explain import ConfidenceTable
+
+        self.fs.fit_quantiles(260, 1200)
+        with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+            tree = gp.Or(gp.cond("move_size", True, 0.7), gp.cond("earn_expected", True, 0.97))
+            table = ConfidenceTable(tree, self.fs, self.ans.big, self.ans.valid, 1500)
+            calls, conf = table.calls(self.fs, 1500)
+            np.testing.assert_array_equal(calls, gp.TreeEvaluator(self.fs, 1500, 1501)(tree)[:, 0])
+            self.assertTrue(np.all((conf >= 0) & (conf <= 1)))
+
     def test_live_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_file, old_drop = P.STATE_FILE, P._drop_unfinished_today

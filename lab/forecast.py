@@ -73,11 +73,19 @@ DAILY_FEATURES: list[tuple[str, str]] = [
     # implied volatility (the options market's own forecasts, market-wide)
     ("vix9d_ratio", "VIX 9-day / VIX (near-term fear)"), ("vix_term", "VIX / VIX 3-month (fear curve)"),
     ("vxn", "Nasdaq implied volatility"), ("vvix", "volatility of the VIX"), ("iv_rank", "VIX rank over the past year"),
+    # this stock's own earnings history
+    ("earn_react", "how big this stock's earnings moves usually are (x its normal move)"),
+    ("earn_expected", "earnings tomorrow x how big its earnings moves usually are (0 if no earnings)"),
+    # its sector (the 11 GICS sectors, equal-weighted)
+    ("sector_ret_1", "its sector's move today"), ("sector_move", "its sector's move today vs normal"),
+    ("sector_vol_ratio", "its sector's recent vs normal volatility"),
+    ("idio_move", "the stock's own move today, apart from its sector, vs normal"),
 ]
 DAILY_NAMES = [n for n, _ in DAILY_FEATURES]
 DAILY_BINARY = frozenset({"earn_next"})
 PLAIN = frozenset({"dow", "vix", "vol_z", "vol_ratio", "move_size", "range_ratio", "spy_vol_20", "vol_20",
-                   "days_to_earn", "days_since_earn", "vix9d_ratio", "vix_term", "vxn", "vvix", "iv_rank"})
+                   "days_to_earn", "days_since_earn", "vix9d_ratio", "vix_term", "vxn", "vvix", "iv_rank",
+                   "earn_react", "earn_expected", "sector_move", "sector_vol_ratio", "idio_move"})
 
 
 # --------------------------------------------------------------------------- #
@@ -97,6 +105,7 @@ class DailyData:
     source: str = "yfinance"
     iv: dict = field(default_factory=dict)          # implied-volatility indices (see lab/daily_extra.py)
     earnings: dict = field(default_factory=dict)    # symbol -> earnings timestamps
+    sectors: dict = field(default_factory=dict)     # symbol -> GICS sector
 
     @property
     def n_symbols(self) -> int:
@@ -109,7 +118,7 @@ class DailyData:
 
 def load_daily(symbols: list[str] | None = None, start: str = START, progress=None,
                synthetic: bool = False, seed: int | None = None) -> DailyData:
-    from lab.daily_extra import IV_TICKERS, iv_context, load_earnings, sp500_universe
+    from lab.daily_extra import IV_TICKERS, iv_context, load_earnings, sp500_sectors, sp500_universe
 
     say = progress or (lambda m: None)
     if synthetic:
@@ -155,7 +164,8 @@ def load_daily(symbols: list[str] | None = None, start: str = START, progress=No
             arrays[k][i] = df[col].to_numpy(dtype=float)
     iv = iv_context(raw, grid)
     earnings = load_earnings(syms, say)
-    return DailyData(syms, grid, spy=spy, vix=iv["vix"], iv=iv, earnings=earnings, source="yfinance", **arrays)
+    return DailyData(syms, grid, spy=spy, vix=iv["vix"], iv=iv, earnings=earnings, sectors=sp500_sectors(),
+                     source="yfinance", **arrays)
 
 
 def _synthetic_daily(symbols: list[str], seed: int | None) -> DailyData:
@@ -170,8 +180,13 @@ def _synthetic_daily(symbols: list[str], seed: int | None) -> DailyData:
     high = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, 0.006, (S, T))))
     low = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, 0.006, (S, T))))
     spy = pd.Series(400 * np.exp(np.cumsum(mkt)), index=grid)
+    ny = "America/New_York"
+    earnings = {sym: [pd.Timestamp(grid[i]).tz_localize(ny) + pd.Timedelta(hours=16, minutes=5)
+                      for i in range(int(rng.integers(5, 60)), T, 63)] for sym in symbols}
+    sectors = {sym: f"Sector {i % 3}" for i, sym in enumerate(symbols)}
     return DailyData(list(symbols), grid, open_, high, low, close, rng.lognormal(14, 0.4, (S, T)), spy,
-                     pd.Series(rng.uniform(12, 30, T), index=grid), source="synthetic")
+                     pd.Series(rng.uniform(12, 30, T), index=grid), source="synthetic", earnings=earnings,
+                     sectors=sectors)
 
 
 # --------------------------------------------------------------------------- #
@@ -183,6 +198,28 @@ class Answers:
     big: np.ndarray       # [S, T] bool: next day's move > median of the previous 60 moves
     valid: np.ndarray     # [S, T] bool: an answer exists
     next_ret: np.ndarray  # [S, T] next-day simple return
+
+
+def _sector_senses(out: np.ndarray, d: DailyData, lr_all: np.ndarray, sd60_all: np.ndarray) -> None:
+    """Equal-weighted sector return per day, and each stock's move apart from its sector (all known at the close)."""
+    groups: dict[str, list[int]] = {}
+    for i, sym in enumerate(d.symbols):
+        sec = (d.sectors or {}).get(sym)
+        if sec:
+            groups.setdefault(sec, []).append(i)
+    for members in groups.values():
+        block = lr_all[members]
+        n_ok = np.isfinite(block).sum(axis=0)
+        sec_r = np.where(n_ok >= 3, np.nanmean(np.where(np.isfinite(block), block, np.nan), axis=0), np.nan)
+        ser = pd.Series(sec_r)
+        sd60 = ser.rolling(60, min_periods=40).std()
+        move = (ser.abs() / sd60).to_numpy()
+        volr = (ser.rolling(5).std() / sd60).to_numpy()
+        for i in members:
+            out[DAILY_NAMES.index("sector_ret_1"), i] = sec_r
+            out[DAILY_NAMES.index("sector_move"), i] = move
+            out[DAILY_NAMES.index("sector_vol_ratio"), i] = volr
+            out[DAILY_NAMES.index("idio_move"), i] = np.abs(lr_all[i] - sec_r) / sd60_all[i]
 
 
 def build_daily_features(d: DailyData) -> tuple[FeatureSet, Answers]:
@@ -211,6 +248,8 @@ def build_daily_features(d: DailyData) -> tuple[FeatureSet, Answers]:
     })
     r20 = np.full((S, T), np.nan)
     r120 = np.full((S, T), np.nan)
+    lr_all = np.full((S, T), np.nan)       # daily log returns, for the sector senses
+    sd60_all = np.full((S, T), np.nan)
     next_ret = np.full((S, T), np.nan)
     big = np.zeros((S, T), dtype=bool)
     big_valid = np.zeros((S, T), dtype=bool)
@@ -245,6 +284,7 @@ def build_daily_features(d: DailyData) -> tuple[FeatureSet, Answers]:
             put("earn_next", s, e_next)
             put("days_to_earn", s, e_to)
             put("days_since_earn", s, e_since)
+            lr_all[s], sd60_all[s] = lr.to_numpy(), sd60.to_numpy()
             r20[s] = np.log(c / c.shift(20)).to_numpy()
             r120[s] = np.log(c / c.shift(120)).to_numpy()
             nr = (c.shift(-1) / c - 1).to_numpy()
@@ -252,6 +292,12 @@ def build_daily_features(d: DailyData) -> tuple[FeatureSet, Answers]:
             typical = (c / c.shift(1) - 1).abs().rolling(60, min_periods=40).median().to_numpy()  # known today
             big[s] = np.abs(nr) > typical
             big_valid[s] = np.isfinite(nr) & np.isfinite(typical)
+            from lab.daily_extra import earnings_reaction
+
+            react = earnings_reaction(e_next, nr, typical)
+            put("earn_react", s, react)
+            put("earn_expected", s, np.where(e_next > 0, react, 0.0))
+        _sector_senses(out, d, lr_all, sd60_all)
         for name, arr in (("rs_rank_20", r20), ("rs_rank_120", r120)):
             ok = np.isfinite(arr)
             ranks = np.where(ok, arr, np.inf).argsort(axis=0).argsort(axis=0).astype(float)

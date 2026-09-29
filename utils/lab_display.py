@@ -393,6 +393,8 @@ class LabDisplay(Display):
             f"above the naive guess + {ACTIVITY_WEIGHT:g} per 10% of calls that are the bold {yes} call (max 5).\n"
             f"A challenger must beat the Alpha by {crown_margin_points():.1f} points (one lucky week can't steal the "
             f"crown). The survivor has {LEAGUE_SIZE - 1} children; the rest are purged.\n"
+            "👻 Council of ancestors: dethroned Alphas go to a Hall of Fame; each generation the one that best fits "
+            "the current market is summoned to compete, and can return to the crown.\n"
             f"Founding Alpha: Bot #{league.alpha.bot_id}: {founder}",
             title=f"📜 PROPHECY LEAGUE · EVOLUTION THROUGH HISTORY · {league.target.upper()}", border_style="magenta"))
 
@@ -410,7 +412,9 @@ class LabDisplay(Display):
                 tag = "" if d["reasoned"] else " NO-REASON"
                 return f"#{b} {d['points']:+.1f}pts ({d['acc']:.1%} right, bold {d['bold']:.0%}){tag}"
 
-            board = "  ".join(cell(b) for b, _, _, _, _ in rec["leaderboard"])
+            board = "  ".join(cell(b) for b, _, _, _, _ in rec["leaderboard"][:6])
+            if len(rec["leaderboard"]) > 6:
+                board += f"  … +{len(rec['leaderboard']) - 6} more"
             label = f"Points over the last {judged} days"
         else:
             board = "  ".join(f"#{b} {acc:.1%}" if acc >= 0 else f"#{b} no-reason"
@@ -420,11 +424,14 @@ class LabDisplay(Display):
         self.console.print(Text(f"{label}: {board}" + (f"   (naive guess this week {naive:.1%})" if naive == naive else ""),
                                 style="white"))
         losers = [f"#{b}" for b, _, _, _, _ in rec["leaderboard"][1:]]
+        shown = ", ".join(losers[:5]) + (f" and {len(losers) - 5} more" if len(losers) > 5 else "")
         self.console.print(Text.assemble(("[ELIMINATED]", "bold white on red"), " ",
-                                         (f"{', '.join(losers)} purged", "red"),
+                                         (f"{shown} purged", "red"),
                                          (f"  · memory purge verified ({rec['purged']}/{rec['purged']})", "bright_black")))
         n_claude = rec.get("claude_children", 0)
-        born = f"5 children born ({n_claude} designed by Claude)" if n_claude else "5 children born"
+        from lab.prophecy import LEAGUE_SIZE
+
+        born = f"{LEAGUE_SIZE - 1} children born" + (f" ({n_claude} designed by Claude)" if n_claude else "")
         pts = bool(rec.get("points") and det)
 
         def fmt(x: float) -> str:
@@ -447,6 +454,9 @@ class LabDisplay(Display):
         self.console.print(Text(f"[SURVIVOR] Bot #{rec['survivor']} ({_role(rec['survivor_role'])}) {verb} · "
                                 f"{born} · mutation {league.rate:.0%}", style="bold bright_green"))
         survivor = next((p for p in league.prophets if p.bot_id == rec["survivor"]), None)
+        if rec["survivor_role"] == "ANCESTOR":
+            self.console.print(Text(f"   👻 An ANCESTOR returned from the Hall of Fame: this old rule fits the current "
+                                    f"market better than anything alive", style="magenta"))
         if survivor is not None and survivor.note and rec["survivor_role"] == "CLAUDE":
             self.console.print(Text(f"   🧠 Claude's idea that won: {survivor.note}", style="magenta"))
         self.pause(0.5)
@@ -502,6 +512,31 @@ class LabDisplay(Display):
         c.print(Panel(f"[bold]Predicts {yes} when:[/] {describe_tree(final.tree, fs)}\n[bold]Otherwise:[/] {no}\n"
                       f"Lifetime accuracy {final.life_accuracy:.2%} over {final.life_total:,} calls",
                       title=f"👑 Current Alpha: Bot #{final.bot_id}", border_style="green"))
+        if s.tiers and sum(v[0] for v in s.tiers.values()):
+            from lab.explain import TIERS
+
+            floors = dict(TIERS)
+            t = Table(box=box.SIMPLE_HEAVY, title="🎯 How sure was it? The reigning Alpha's calls by confidence (unseen days)")
+            for col in ("Confidence", "Share of calls", "Alpha right", "Naive guess on the same calls", "Edge (pts)"):
+                t.add_column(col, justify="left" if col == "Confidence" else "right")
+            total = sum(v[0] for v in s.tiers.values())
+            for name in ("HIGH", "MEDIUM", "LOW"):
+                n, a, b = s.tiers[name]
+                if not n:
+                    t.add_row(name, "0%", "-", "-", "-")
+                    continue
+                edge = (a - b) / n * 100
+                label_ = f"{name} (was right ≥{floors[name]:.0%} before)" if floors[name] else f"{name}"
+                t.add_row(label_, f"{n / total:.1%}", f"{a / n:.1%}", f"{b / n:.1%}",
+                          Text(f"{edge:+.2f}", style=pnl_style(edge)))
+            c.print(t)
+            c.print(Text("Confidence = how often calls made for exactly the same reason were right in the year before. "
+                         "If HIGH calls really are right more often, you can act on those and skip the rest.",
+                         style="bright_black"))
+        if lg.hall:
+            back = sum(1 for h in lg.history if h.get("survivor_role") == "ANCESTOR")
+            c.print(Text(f"👻 Hall of Fame: {len(lg.hall)} ancestors kept · an ancestor returned to the crown {back} times",
+                         style="magenta"))
         if s.explain:
             self.prophecy_playbook(s.target, s.explain)
         if s.chart:
@@ -545,7 +580,10 @@ class LabDisplay(Display):
                         f"Says {yes}", "This week (live)", f"Tomorrow: says {yes} for"):
                 t.add_column(col, justify="left" if col in ("Prophet", "Role") else "right")
             calls = calls_today.get(target, {})
-            for p in sorted(lg.prophets, key=lambda p: judge.get(p.bot_id, {}).get("points", -1e9), reverse=True):
+            ranked = sorted(lg.prophets, key=lambda p: judge.get(p.bot_id, {}).get("points", -1e9), reverse=True)
+            if len(ranked) > 8:
+                t.caption = f"top 8 of {len(ranked)} prophets"
+            for p in ranked[:8]:
                 n_yes = sum(calls.get(str(p.bot_id), []))
                 d = judge.get(p.bot_id)
                 t.add_row(f"Bot #{p.bot_id}", _role(p.role),
@@ -594,9 +632,15 @@ class LabDisplay(Display):
                 t.add_row(lf["text"], f"{lf['fires']:.1%}", Text("-" if rate != rate else f"{rate:.1%}", style=style),
                           f"{pb['base']:.1%}", f"{lf['cases']:,}")
             c.print(t)
-        for sym, hit, why in ex.get("samples", []):
+        samples = ex.get("samples", [])
+        if samples:
+            from lab.explain import tier
+
+            c.print(Text("Its most confident calls for tomorrow:", style="bold"))
+        for sym, hit, why, *rest in samples:
+            conf = f"  {tier(rest[0])} {rest[0]:.0%}" if rest else ""
             c.print(Text.assemble((f"  {sym:<6} → ", "white"), (f"{yes if hit else no:<5}", "bold green" if hit else "bright_black"),
-                                  ("  because " + " AND ".join(why), "bright_black")))
+                                  (conf, "cyan"), ("  because " + " AND ".join(why), "bright_black")))
 
     def breeder_scoreboard(self, lg) -> None:
         """Who wins rounds: Claude's designs or blind random offspring? (per child slot, so it's fair)"""
@@ -611,7 +655,9 @@ class LabDisplay(Display):
             if not n_c:
                 continue
             slots["CLAUDE"] += n_c
-            slots["MUTANT"] += 4 - n_c
+            from lab.prophecy import LEAGUE_SIZE
+
+            slots["MUTANT"] += LEAGUE_SIZE - 2 - n_c
             slots["CROSSOVER"] += 1
             wins[cur["survivor_role"]] = wins.get(cur["survivor_role"], 0) + 1
         judged = sum(wins.values())
@@ -641,4 +687,4 @@ def _pct(x: float) -> str:
 
 
 def _role(role: str) -> str:
-    return "Claude-bred" if role == "CLAUDE" else role.title()
+    return {"CLAUDE": "Claude-bred", "ANCESTOR": "Ancestor"}.get(role, role.title())

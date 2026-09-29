@@ -61,6 +61,51 @@ def sp500_universe(fallback: list[str]) -> list[str]:
         return list(fallback)
 
 
+def sp500_sectors() -> dict[str, str]:
+    """Ticker -> GICS sector (11 sectors), from the same Wikipedia table; cached for 30 days. {} if unavailable."""
+    cache = config.DATA_CACHE_DIR / "sp500_sectors.json"
+    try:
+        if cache.is_file() and time.time() - cache.stat().st_mtime < 30 * 86400:
+            return json.loads(cache.read_text())
+        req = urllib.request.Request(WIKI_URL, headers={"User-Agent": "Mozilla/5.0 (evolution-arena research)"})
+        html = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore")
+        table = html.split('id="constituents"', 1)[1].split("</table>", 1)[0]
+        out = {}
+        for row in table.split("<tr")[2:]:
+            cells = [re.sub(r"<[^>]+>", "", c.split(">", 1)[1]).strip() for c in row.split("<td")[1:4]]
+            if len(cells) == 3 and cells[0]:
+                out[cells[0].replace(".", "-")] = cells[2]
+        if len(out) < 400:
+            raise ValueError(f"only parsed {len(out)} sectors")
+        config.DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(out))
+        return out
+    except Exception as exc:
+        log.warning("S&P 500 sectors unavailable (%s) - sector senses disabled", exc)
+        return {}
+
+
+def earnings_reaction(earn_next: np.ndarray, next_ret: np.ndarray, normal: np.ndarray, last_n: int = 8) -> np.ndarray:
+    """
+    How big this stock's earnings reactions USUALLY are, in multiples of its normal daily move:
+    the average of |move| / normal over its last `last_n` earnings reactions.
+
+    A reaction flagged on day j is the move from close j to close j+1, so it only becomes
+    known at day j+1 - the value at day t never uses a reaction that hadn't finished by t.
+    """
+    T = len(earn_next)
+    known = np.full(T, np.nan)
+    for j in np.flatnonzero(earn_next > 0):
+        if j + 1 < T and np.isfinite(next_ret[j]) and np.isfinite(normal[j]) and normal[j] > 0:
+            known[j + 1] = abs(next_ret[j]) / normal[j]
+    s = pd.Series(known)
+    events = s.dropna()
+    if events.empty:
+        return np.full(T, np.nan)
+    avg = events.rolling(last_n, min_periods=1).mean()
+    return avg.reindex(range(T)).ffill().to_numpy()
+
+
 def load_earnings(symbols: list[str], say=lambda m: None, max_age_days: int = 7) -> dict[str, list[pd.Timestamp]]:
     """Earnings announcement timestamps (America/New_York), past and scheduled, per stock."""
     EARNINGS_DIR.mkdir(parents=True, exist_ok=True)

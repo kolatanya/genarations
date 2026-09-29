@@ -41,6 +41,7 @@ class Schema:
     names: list
     binary: frozenset
     plain: frozenset = frozenset()   # features whose thresholds are shown as plain numbers, not %
+    hidden: frozenset = frozenset()  # features evolution may not pick for new leaves (experiments)
 
 
 _SCHEMA = Schema(list(FEATURE_NAMES), frozenset(BINARY_FEATURES),
@@ -48,11 +49,11 @@ _SCHEMA = Schema(list(FEATURE_NAMES), frozenset(BINARY_FEATURES),
 
 
 @contextmanager
-def schema(names, binary=frozenset(), plain=frozenset()):
+def schema(names, binary=frozenset(), plain=frozenset(), hidden=frozenset()):
     """Temporarily evolve rules over a different feature set (e.g. the daily Forecaster)."""
     global _SCHEMA
     old = _SCHEMA
-    _SCHEMA = Schema(list(names), frozenset(binary), frozenset(plain))
+    _SCHEMA = Schema(list(names), frozenset(binary), frozenset(plain), frozenset(hidden))
     try:
         yield _SCHEMA
     finally:
@@ -96,6 +97,8 @@ Node = Union[Cond, And, Or, Not]
 # --------------------------------------------------------------------------- #
 def random_cond(rng: random.Random) -> Cond:
     f = rng.randrange(len(_SCHEMA.names))
+    while _SCHEMA.hidden and _SCHEMA.names[f] in _SCHEMA.hidden:
+        f = rng.randrange(len(_SCHEMA.names))
     if _SCHEMA.names[f] in _SCHEMA.binary:
         return Cond(f, rng.random() < 0.5, 0.5, 0.05)
     # Extreme quantiles make selective rules; the middle makes noisy ones.
