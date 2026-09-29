@@ -377,37 +377,75 @@ class LabDisplay(Display):
     # ------------------------------------------------------------------ #
     # Prophecy League
     # ------------------------------------------------------------------ #
-    def prophecy_replay_intro(self, league, first, last, days: int) -> None:
+    def prophecy_replay_intro(self, league, first, last, days: int, fresh: bool = False) -> None:
         from lab.forecast import TARGETS
-        from lab.prophecy import LEAGUE_SIZE, ROUND_DAYS
+        from lab.prophecy import ACCURACY_WEIGHT, ACTIVITY_WEIGHT, JUDGE_DAYS, LEAGUE_SIZE, ROUND_DAYS, crown_margin_points
 
         yes, no, question = TARGETS[league.target]
+        founder = ("a plain beginner rule - everything else must be learned by survival" if fresh
+                   else "the Forecaster Arena champion (if you've run option 8)")
         self.console.print(Panel(
             f"Question: [bold]{question}[/] ({yes}/{no}) for every stock, every day\n"
-            f"Replaying [bold]{first} → {last}[/] one day at a time. Each day the {LEAGUE_SIZE} prophets only know "
-            "the past.\n"
-            f"Every {ROUND_DAYS} trading days: the most accurate prophet survives and has {LEAGUE_SIZE - 1} children; "
-            "the rest are purged.\n"
-            f"Founding Alpha: Bot #{league.alpha.bot_id} (the Forecaster Arena champion, if you've run option 8)",
-            title=f"📜 PROPHECY LEAGUE · REPLAY · {league.target.upper()}", border_style="magenta"))
+            f"[bold]{days // ROUND_DAYS} generations[/], {first} → {last}. Each generation is judged on "
+            f"{ROUND_DAYS} trading days it has NEVER seen.\n"
+            "Bots keep no market data - only their rule (the strategy they inherited from their Alpha).\n"
+            f"Crown = most POINTS over the last {JUDGE_DAYS} known days: {ACCURACY_WEIGHT:g} per % of calls right "
+            f"above the naive guess + {ACTIVITY_WEIGHT:g} per 10% of calls that are the bold {yes} call (max 5).\n"
+            f"A challenger must beat the Alpha by {crown_margin_points():.1f} points (one lucky week can't steal the "
+            f"crown). The survivor has {LEAGUE_SIZE - 1} children; the rest are purged.\n"
+            f"Founding Alpha: Bot #{league.alpha.bot_id}: {founder}",
+            title=f"📜 PROPHECY LEAGUE · EVOLUTION THROUGH HISTORY · {league.target.upper()}", border_style="magenta"))
 
     def prophecy_round(self, league, rec: dict, naive_days: list) -> None:
         if self.quiet:
             return
         naive = float(np.mean(naive_days)) if naive_days else float("nan")
-        board = "  ".join(f"#{b} {acc:.1%}" for b, _, acc, _, _ in rec["leaderboard"])
-        self.console.print(Rule(f"[cyan]Round {rec['round']} · {rec['dates']}[/]", style="cyan"))
-        self.console.print(Text(f"Calls correct: {board}   (naive guess {naive:.1%})", style="white"))
+        judged = rec.get("judge_days", 5)
+        det = rec.get("details") or {}
+        if rec.get("points") and det:
+            def cell(b: int) -> str:
+                d = det.get(str(b))
+                if d is None:
+                    return f"#{b} ?"
+                tag = "" if d["reasoned"] else " NO-REASON"
+                return f"#{b} {d['points']:+.1f}pts ({d['acc']:.1%} right, bold {d['bold']:.0%}){tag}"
+
+            board = "  ".join(cell(b) for b, _, _, _, _ in rec["leaderboard"])
+            label = f"Points over the last {judged} days"
+        else:
+            board = "  ".join(f"#{b} {acc:.1%}" if acc >= 0 else f"#{b} no-reason"
+                              for b, _, acc, _, _ in rec["leaderboard"])
+            label = "Calls correct" if judged <= 5 else f"Correct over the last {judged} days"
+        self.console.print(Rule(f"[cyan]Generation {rec['round']} · {rec['dates']}[/]", style="cyan"))
+        self.console.print(Text(f"{label}: {board}" + (f"   (naive guess this week {naive:.1%})" if naive == naive else ""),
+                                style="white"))
         losers = [f"#{b}" for b, _, _, _, _ in rec["leaderboard"][1:]]
         self.console.print(Text.assemble(("[ELIMINATED]", "bold white on red"), " ",
                                          (f"{', '.join(losers)} purged", "red"),
                                          (f"  · memory purge verified ({rec['purged']}/{rec['purged']})", "bright_black")))
-        verb = (f"dethroned Bot #{rec['alpha_before']}" if rec["dethroned"] else "defended the crown")
         n_claude = rec.get("claude_children", 0)
         born = f"5 children born ({n_claude} designed by Claude)" if n_claude else "5 children born"
-        self.console.print(Text(f"[SURVIVOR] Bot #{rec['survivor']} ({_role(rec['survivor_role'])}) {verb} with "
-                                f"{rec['survivor_accuracy']:.1%} correct · {born} · mutation {league.rate:.0%}",
-                                style="bold bright_green"))
+        pts = bool(rec.get("points") and det)
+
+        def fmt(x: float) -> str:
+            if pts:
+                return f"{x:+.2f} pts" if x > -500 else "no reason - always the same answer"
+            return f"{x:.1%}" if x >= 0 else "no reason - always the same answer"
+
+        if rec["dethroned"]:
+            verb = (f"beat the old Alpha Bot #{rec['alpha_before']} on the SAME {judged} days: "
+                    f"{fmt(rec['survivor_accuracy'])} vs {fmt(rec['alpha_accuracy'])}")
+        else:
+            verb = f"defended the crown with {fmt(rec['survivor_accuracy'])}"
+            close = [(b, acc) for b, _, acc, _, _ in rec["leaderboard"][1:] if acc > rec["survivor_accuracy"]]
+            if close:
+                b, acc = max(close, key=lambda x: x[1])
+                margin = rec.get("margin", 0.003)
+                verb += (f" (Bot #{b} scored {fmt(acc)}, but a challenger must beat the Alpha by "
+                         f"{fmt(margin) if pts else f'{margin * 100:.1f} pts'} - it needed "
+                         f"{fmt(rec['survivor_accuracy'] + margin)})")
+        self.console.print(Text(f"[SURVIVOR] Bot #{rec['survivor']} ({_role(rec['survivor_role'])}) {verb} · "
+                                f"{born} · mutation {league.rate:.0%}", style="bold bright_green"))
         survivor = next((p for p in league.prophets if p.bot_id == rec["survivor"]), None)
         if survivor is not None and survivor.note and rec["survivor_role"] == "CLAUDE":
             self.console.print(Text(f"   🧠 Claude's idea that won: {survivor.note}", style="magenta"))
@@ -434,8 +472,24 @@ class LabDisplay(Display):
         t.add_row(f"Naive guess (the more common answer last year)", f"{s.naive_accuracy:.2%}", "0.00", "-")
         t.add_row("Coin flip", "50.00%", f"{(0.5 - s.naive_accuracy) * 100:+.2f}", "-")
         c.print(t)
-        c.print(Text(f"{len(lg.history)} rounds · the crown changed hands {dethroned} times · "
+        c.print(Text(f"{len(lg.history)} generations · the crown changed hands {dethroned} times · "
                      f"{len(lg.history) * 5:,} prophets purged", style="bright_black"))
+        eras = s.eras()
+        if eras:
+            e = Table(box=box.SIMPLE_HEAVY, title="📈 Did they get better? The reigning Alpha on unseen weeks, era by era")
+            for col in ("Generations", "Dates", "Alpha correct", "Naive guess", "Edge (pts)"):
+                e.add_column(col, justify="left" if col in ("Generations", "Dates") else "right")
+            for r in eras:
+                e.add_row(f"{r['first_gen']}–{r['last_gen']}", f"{r['from']} → {r['to']}", f"{r['alpha']:.2%}",
+                          f"{r['naive']:.2%}", Text(f"{r['edge']:+.2f}", style=pnl_style(r["edge"])))
+            c.print(e)
+            first, last_ = eras[0]["edge"], eras[-1]["edge"]
+            trend = ("the edge grew from the first era to the last" if last_ > first + 0.5 else
+                     "the edge shrank from the first era to the last" if last_ < first - 0.5 else
+                     "the edge stayed about the same from the first era to the last")
+            c.print(Text(f"Edge = points better than the naive guess. Over this run {trend} "
+                         f"({first:+.2f} → {last_:+.2f}). Markets change too, so eras aren't perfectly comparable.",
+                         style="bright_black"))
         self.breeder_scoreboard(lg)
         if lo > 0:
             verdict = "[bold green]Real predictive power:[/] the reigning prophet beat the naive guess, and even the pessimistic end of the range is above zero."
@@ -448,6 +502,8 @@ class LabDisplay(Display):
         c.print(Panel(f"[bold]Predicts {yes} when:[/] {describe_tree(final.tree, fs)}\n[bold]Otherwise:[/] {no}\n"
                       f"Lifetime accuracy {final.life_accuracy:.2%} over {final.life_total:,} calls",
                       title=f"👑 Current Alpha: Bot #{final.bot_id}", border_style="green"))
+        if s.explain:
+            self.prophecy_playbook(s.target, s.explain)
         if s.chart:
             c.print(Text(f"Chart: {s.chart}", style="bright_black"))
         _ = wins
@@ -457,8 +513,9 @@ class LabDisplay(Display):
                                  "Run this once every evening after 9:15pm UK: it scores yesterday's calls "
                                  "and makes tomorrow's.", border_style="magenta", title="📜 PROPHECY LEAGUE · LIVE"))
 
-    def prophecy_live(self, today: str, symbols, leagues, reveals, rounds, calls_today, fs) -> None:
+    def prophecy_live(self, today: str, symbols, leagues, reveals, rounds, calls_today, fs, judge_scores=None) -> None:
         from lab.forecast import TARGETS
+        from lab.prophecy import JUDGE_DAYS
 
         c = self.console
         if reveals:
@@ -483,13 +540,18 @@ class LabDisplay(Display):
             yes, no, question = TARGETS[target]
             t = Table(title=f"{target.upper()} league · round {lg.round_no + 1} · day {lg.round_days}/5 · {question}",
                       box=box.SIMPLE_HEAVY)
-            for col in ("Prophet", "Role", "Round accuracy", "Lifetime accuracy", f"Tomorrow: says {yes} for"):
+            judge = (judge_scores or {}).get(target, {})
+            for col in ("Prophet", "Role", f"Points, last {JUDGE_DAYS} days (decides the crown)", "Right",
+                        f"Says {yes}", "This week (live)", f"Tomorrow: says {yes} for"):
                 t.add_column(col, justify="left" if col in ("Prophet", "Role") else "right")
             calls = calls_today.get(target, {})
-            for p in sorted(lg.prophets, key=lambda p: p.accuracy, reverse=True):
+            for p in sorted(lg.prophets, key=lambda p: judge.get(p.bot_id, {}).get("points", -1e9), reverse=True):
                 n_yes = sum(calls.get(str(p.bot_id), []))
-                t.add_row(f"Bot #{p.bot_id}", _role(p.role), f"{p.accuracy:.1%}" if p.total else "-",
-                          f"{p.life_accuracy:.1%}" if p.life_total else "-", f"{n_yes}/{len(symbols)} stocks")
+                d = judge.get(p.bot_id)
+                t.add_row(f"Bot #{p.bot_id}", _role(p.role),
+                          "-" if d is None else (f"{d['points']:+.1f}" if d["reasoned"] else "no reason"),
+                          "-" if d is None else f"{d['acc']:.1%}", "-" if d is None else f"{d['bold']:.0%}",
+                          f"{p.accuracy:.1%}" if p.total else "-", f"{n_yes}/{len(symbols)} stocks")
             c.print(t)
             ideas = [p for p in lg.prophets if p.note]
             if ideas:
@@ -506,6 +568,35 @@ class LabDisplay(Display):
             c.print(Panel(f"Direction Alpha says UP tomorrow for {len(ups)} of {len(symbols)} stocks"
                           + (f": {', '.join(ups[:15])}{' …' if len(ups) > 15 else ''}" if ups else ""),
                           title=f"🔮 Tomorrow's prophecies (made with data through {today})", border_style="magenta"))
+
+    def prophecy_playbook(self, target: str, ex: dict) -> None:
+        """Why the Alpha calls what it calls: its rule, each condition's track record, and example calls."""
+        from lab.forecast import TARGETS
+
+        yes, no, _ = TARGETS[target]
+        pb = ex["playbook"]
+        c = self.console
+        lines = [f"[bold]Says {yes} when:[/] {ex['rule']}   [bright_black](otherwise {no})[/]"]
+        if pb.get("n"):
+            lines.append(f"Track record, last {pb['days']} days ({pb['n']:,} calls): says {yes} on {pb['says_yes']:.0%} "
+                         f"of calls · right [bold]{_pct(pb['right_yes'])}[/] when it says {yes}, "
+                         f"{_pct(pb['right_no'])} when it says {no} · overall {pb['accuracy']:.1%} "
+                         f"(the answer was {yes} {pb['base']:.1%} of the time)")
+        c.print(Panel("\n".join(lines), title=f"🔎 Bot #{ex['bot']}'s playbook · {target} league", border_style="cyan"))
+        if pb.get("leaves"):
+            t = Table(box=box.SIMPLE, title="Its reasons, one by one")
+            for col in ("Condition", "Fires on", f"{yes} when it fires", f"{yes} normally", "Cases"):
+                t.add_column(col, justify="left" if col == "Condition" else "right")
+            for lf in pb["leaves"]:
+                rate = lf["yes_when_fires"]
+                style = "green" if rate == rate and rate > pb["base"] + 0.02 else (
+                    "red" if rate == rate and rate < pb["base"] - 0.02 else "white")
+                t.add_row(lf["text"], f"{lf['fires']:.1%}", Text("-" if rate != rate else f"{rate:.1%}", style=style),
+                          f"{pb['base']:.1%}", f"{lf['cases']:,}")
+            c.print(t)
+        for sym, hit, why in ex.get("samples", []):
+            c.print(Text.assemble((f"  {sym:<6} → ", "white"), (f"{yes if hit else no:<5}", "bold green" if hit else "bright_black"),
+                                  ("  because " + " AND ".join(why), "bright_black")))
 
     def breeder_scoreboard(self, lg) -> None:
         """Who wins rounds: Claude's designs or blind random offspring? (per child slot, so it's fair)"""
@@ -543,6 +634,10 @@ class LabDisplay(Display):
         if breeder.failures:
             msg += f" (fell back to random mutation {breeder.failures}x: {breeder.last_error})"
         self.console.print(Text(msg, style="bright_black" if not breeder.failures else "yellow"))
+
+
+def _pct(x: float) -> str:
+    return f"{x:.1%}" if x == x else "-"
 
 
 def _role(role: str) -> str:

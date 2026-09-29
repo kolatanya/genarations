@@ -58,7 +58,10 @@ Design principles:
   add a filter that separates right from wrong calls). Small, careful edits usually beat rewrites.
 - Rules made only of MARKET-WIDE senses give the same call for every stock; stock-specific senses
   let a prophet say YES for some stocks and NO for others, which is how it can beat the naive guess.
-- Accuracy is what counts. A child that says YES too often or too rarely loses to the base rate.
+- The crown goes to the most POINTS over the last 60 days: 2 points per percentage point of accuracy
+  above the naive guess, plus 1 point per 10%% of calls that are YES (max 5 at 50%%). Accuracy counts
+  double, but a rule that makes the YES call often (when it has a reason to) is rewarded.
+- A rule that gives the same answer on more than 97%% of calls has no reason and cannot win.
 - Make the children different from each other and from the survivor.
 
 Reply with ONLY a JSON object: {"children": [{"why": "<one short sentence>", "rule": <tree>}, ...]}"""

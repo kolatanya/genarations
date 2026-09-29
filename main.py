@@ -13,6 +13,7 @@ Evolution Arena - entry point.
     python main.py --mode forecast --target both    # Forecaster Arena: bots scored on prediction accuracy
     python main.py --mode predict                   # Prophecy League LIVE: score yesterday, predict tomorrow
     python main.py --mode predict --replay 250      # Prophecy League REPLAY over the last 250 trading days
+    python main.py --mode predict --generations 300 # Prophecy League: evolve 300 generations through history
 
 Run `python main.py --help` for every flag.
 """
@@ -80,6 +81,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     lab.add_argument("--target", choices=("direction", "volatility", "both"),
                      help="Forecaster: predict UP/DOWN, BIG/CALM moves, or both")
     lab.add_argument("--replay", type=int, help="Prophecy League: replay the last N trading days instead of live")
+    lab.add_argument("--champion", action="store_true",
+                     help="Prophecy generations: start from the Forecaster champion instead of a beginner rule")
     lab.add_argument("--no-claude", action="store_true",
                      help="Prophecy League: don't let Claude design children (all random mutation)")
     parser.add_argument("--fast", action="store_true", help="No dramatic pauses (for testing / long runs)")
@@ -107,7 +110,7 @@ def interactive_menu(display: Display) -> str | None:
         "[bold magenta]  6[/]  🗳  Lab live trading     [bright_black]- the Lab's ensemble trades your Alpaca PAPER account[/]\n"
         "[bold magenta]  7[/]  🔄 Re-evolve challenger [bright_black]- weekly: evolve on the newest data, shadow-test it live[/]\n"
         "[bold cyan]  8[/]  🔮 Forecaster Arena     [bright_black]- bots scored on prediction accuracy: UP/DOWN and BIG/CALM moves[/]\n"
-        "[bold cyan]  9[/]  📜 Prophecy League      [bright_black]- bots predict the REAL future daily; most accurate survive[/]\n"
+        "[bold cyan]  9[/]  📜 Prophecy League      [bright_black]- bots predict unseen weeks; most accurate survive & breed[/]\n"
         "[bold]  q[/]  Quit"
     )
     choice = Prompt.ask("Select mode", choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "q"], default=default,
@@ -361,25 +364,51 @@ def run_prophecy(args: argparse.Namespace, display: LabDisplay, interactive: boo
 
     from lab.claude_breeder import make_breeder
     from lab.forecast import build_daily_features, load_daily
-    from lab.prophecy import live_step, replay
+    from rich.prompt import Confirm
+
+    from lab.prophecy import ROUND_DAYS, live_step, max_generations, replay
 
     breeder, status_msg = make_breeder(enabled=not args.no_claude)
-    (display.success if breeder else display.info)(status_msg)
     days = args.replay
-    if interactive and days is None:
-        pick = Prompt.ask("[1] LIVE: score yesterday's calls & predict tomorrow (run each evening)   "
-                          "[2] REPLAY the last year day by day", choices=["1", "2"], default="1",
-                          console=display.console)
-        if pick == "2":
-            days = max(20, IntPrompt.ask("How many trading days to replay?", default=250, console=display.console))
+    generations = args.generations
+    fresh = not args.champion
+    target = args.target
+    if interactive and days is None and generations is None:
+        pick = Prompt.ask("[1] EVOLVE: run N generations through history, each judged on a week it has never seen\n"
+                          "[2] LIVE: score yesterday's calls & predict tomorrow (run each evening)\n"
+                          "Choose", choices=["1", "2"], default="1", console=display.console)
+        if pick == "1":
+            generations = max(1, IntPrompt.ask("How many generations? (1 generation = 1 unseen week; up to ~690)",
+                                               default=100, console=display.console))
+            if target is None:
+                t_pick = Prompt.ask("Predict what? [1] UP/DOWN direction  [2] BIG/CALM moves  [3] both",
+                                    choices=["1", "2", "3"], default="3", console=display.console)
+                target = {"1": "direction", "2": "volatility", "3": "both"}[t_pick]
+            fresh = Prompt.ask("Start from [1] a beginner rule (clean test)  [2] the Forecaster champion",
+                               choices=["1", "2"], default="1", console=display.console) == "1"
+    history_mode = bool(days or generations)
+    targets = ("direction", "volatility") if (target or "both") == "both" else (target,)
+    if history_mode and breeder is not None:
+        n_calls = (generations or (days or 0) // ROUND_DAYS) * len(targets)
+        if interactive and not Confirm.ask(f"Let Claude design children every generation? (~{n_calls} API calls; "
+                                           "otherwise all children are random mutants)",
+                                           default=n_calls <= 100, console=display.console):
+            breeder, status_msg = None, "Claude breeder OFF for this run - all children are random mutants."
+    (display.success if breeder else display.info)(status_msg)
     with display.console.status("Loading daily history...") as status:
         data = load_daily(progress=lambda m: status.update(m), synthetic=args.synthetic, seed=args.seed)
         status.update("Computing features and answers...")
         fs, answers = build_daily_features(data)
-    if days:
-        targets = ("direction", "volatility") if (args.target or "both") == "both" else (args.target,)
+    if history_mode:
+        if generations:
+            limit = max_generations(data.n_days)
+            if generations > limit:
+                display.warn(f"Only enough history for {limit} generations - running {limit}.")
+                generations = limit
+            days = generations * ROUND_DAYS
         for t in targets:
-            summary = replay(fs, answers, data.index, t, display, days=days, seed=args.seed, breeder=breeder)
+            summary = replay(fs, answers, data.index, t, display, days=days, seed=args.seed, breeder=breeder,
+                             fresh=fresh)
             display.prophecy_replay_summary(summary, fs)
         display.claude_breeder_status(breeder)
         return EXIT_OK

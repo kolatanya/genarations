@@ -219,6 +219,25 @@ class TreeEvaluator:
         return (a & b) if isinstance(node, And) else (a | b)
 
 
+def simplify(node: Node) -> Node:
+    """Remove redundancy so a rule reads like a reason: 'A OR A' -> 'A', 'NOT NOT A' -> 'A'."""
+    if isinstance(node, Cond):
+        return node
+    if isinstance(node, Not):
+        child = simplify(node.child)
+        return child.child if isinstance(child, Not) else Not(child)
+    left, right = simplify(node.left), simplify(node.right)
+    if key(left) == key(right):
+        return left
+    op = type(node)
+    # (A op B) op A  ->  A op B   (the repeated part adds nothing)
+    for inner, other in ((left, right), (right, left)):
+        if isinstance(inner, (And, Or)) and key(other) in (key(inner.left), key(inner.right)):
+            # same op: (A op B) op A -> A op B.  Mixed (absorption): (A AND B) OR A -> A, (A OR B) AND A -> A
+            return inner if isinstance(inner, op) else other
+    return op(left, right)
+
+
 # --------------------------------------------------------------------------- #
 # Variation
 # --------------------------------------------------------------------------- #

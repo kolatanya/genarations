@@ -60,6 +60,61 @@ class ProphecyTests(unittest.TestCase):
         self.assertEqual(len(s.days), 60)
         self.assertTrue(0 <= s.alpha_accuracy <= 1)
 
+    def test_generations_from_a_fresh_start(self) -> None:
+        from lab.forecast import textbook_tree
+
+        gens = 20
+        s = P.replay(self.fs, self.ans, self.data.index, "direction", LabDisplay(delay=0, quiet=True),
+                     days=gens * P.ROUND_DAYS, seed=3, save_chart=False, fresh=True)
+        self.assertEqual(len(s.league.history), gens)
+        with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+            founder = s.league.history[0]["leaderboard"]
+            self.assertEqual(len(founder), P.LEAGUE_SIZE)
+            self.assertEqual(gp.key(gp.from_json(P.found_league("direction", random.Random(0), "x", fresh=True)
+                                                 .alpha.tree)), gp.key(textbook_tree("direction")))
+        eras = s.eras()
+        self.assertEqual(len(eras), 5)
+        self.assertEqual(eras[0]["first_gen"], 1)
+        self.assertEqual(eras[-1]["last_gen"], gens)
+        pooled = sum(r["alpha"] for r in eras) / 5
+        self.assertAlmostEqual(pooled, s.alpha_accuracy, delta=0.02)
+        self.assertGreater(P.max_generations(self.data.n_days), 100)
+
+    def test_every_call_has_a_reason_that_reproduces_it(self) -> None:
+        from lab.explain import playbook, reason
+
+        self.fs.fit_quantiles(260, 1200)
+        with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+            a, b = gp.cond("move_size", True, 0.7), gp.cond("rsi_2", False, 0.2)
+            self.assertEqual(gp.key(gp.simplify(gp.Or(gp.Or(a, b), a))), gp.key(gp.Or(a, b)))
+            self.assertEqual(gp.key(gp.simplify(gp.Not(gp.Not(a)))), gp.key(a))
+            tree = gp.Or(gp.And(a, gp.Not(b)), gp.cond("vol_z", True, 0.9))
+            t = 1500
+            calls = gp.TreeEvaluator(self.fs, t, t + 1)(tree)[:, 0]
+            for s in range(self.fs.values.shape[1]):
+                hit, why = reason(tree, self.fs, s, t)
+                self.assertEqual(hit, bool(calls[s]))            # the reason gives exactly the call
+                self.assertTrue(why)
+                self.assertTrue(all(("✓" in w) == hit for w in why) or not hit)
+            pb = playbook(tree, self.fs, self.ans.big, self.ans.valid, t)
+            self.assertEqual(len(pb["leaves"]), 3)
+            self.assertTrue(0 <= pb["accuracy"] <= 1)
+
+    def test_lucky_week_cannot_steal_the_crown(self) -> None:
+        rng = random.Random(4)
+        with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
+            lg = P.found_league("volatility", rng, "2025-01-01")
+            alpha, challenger = lg.prophets[0].bot_id, lg.prophets[1].bot_id
+            scores = {p.bot_id: 0.50 for p in lg.prophets}
+            scores[challenger] = 0.50 + P.crown_margin_points() / 2           # better, but not by enough
+            rec = P.judge_round(lg, rng, "2025-01-08", "t", scores=scores, judge_days=P.JUDGE_DAYS)
+            self.assertEqual(rec["survivor"], alpha)
+            alpha, challenger = lg.alpha.bot_id, lg.prophets[1].bot_id
+            scores = {p.bot_id: 0.50 for p in lg.prophets}
+            scores[challenger] = 0.50 + P.crown_margin_points() * 2           # clearly better
+            rec = P.judge_round(lg, rng, "2025-01-15", "t", scores=scores, judge_days=P.JUDGE_DAYS)
+            self.assertEqual(rec["survivor"], challenger)
+
     def test_live_state_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             old_file, old_drop = P.STATE_FILE, P._drop_unfinished_today
