@@ -184,6 +184,15 @@ LIVE_LOOKBACK_DAYS: int = _P["live_lookback_days"]  # Calendar days of bars fetc
 LIVE_STATE_FILE: Final[str] = "live_state.json"
 
 
+# ---------------------------------------------------------------------------
+# Claude breeder (Prophecy League): an AI designs some of the children
+# ---------------------------------------------------------------------------
+ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
+CLAUDE_BREEDER: bool = os.getenv("CLAUDE_BREEDER", "on").strip().lower() not in ("off", "0", "false", "no")
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-opus-5-5")
+CLAUDE_CHILDREN: int = 3                    # of the 5 children; 1 random mutant + 1 crossover always stay as a control
+
+
 # ===========================================================================
 # EVOLUTION LAB (v2) - islands, rule-inventing bots, years of data, luck tests
 # ===========================================================================

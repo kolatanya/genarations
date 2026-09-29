@@ -403,9 +403,14 @@ class LabDisplay(Display):
                                          (f"{', '.join(losers)} purged", "red"),
                                          (f"  · memory purge verified ({rec['purged']}/{rec['purged']})", "bright_black")))
         verb = (f"dethroned Bot #{rec['alpha_before']}" if rec["dethroned"] else "defended the crown")
-        self.console.print(Text(f"[SURVIVOR] Bot #{rec['survivor']} ({rec['survivor_role'].title()}) {verb} with "
-                                f"{rec['survivor_accuracy']:.1%} correct · 5 children born · mutation {league.rate:.0%}",
+        n_claude = rec.get("claude_children", 0)
+        born = f"5 children born ({n_claude} designed by Claude)" if n_claude else "5 children born"
+        self.console.print(Text(f"[SURVIVOR] Bot #{rec['survivor']} ({_role(rec['survivor_role'])}) {verb} with "
+                                f"{rec['survivor_accuracy']:.1%} correct · {born} · mutation {league.rate:.0%}",
                                 style="bold bright_green"))
+        survivor = next((p for p in league.prophets if p.bot_id == rec["survivor"]), None)
+        if survivor is not None and survivor.note and rec["survivor_role"] == "CLAUDE":
+            self.console.print(Text(f"   🧠 Claude's idea that won: {survivor.note}", style="magenta"))
         self.pause(0.5)
 
     def prophecy_replay_summary(self, s, fs) -> None:
@@ -431,6 +436,7 @@ class LabDisplay(Display):
         c.print(t)
         c.print(Text(f"{len(lg.history)} rounds · the crown changed hands {dethroned} times · "
                      f"{len(lg.history) * 5:,} prophets purged", style="bright_black"))
+        self.breeder_scoreboard(lg)
         if lo > 0:
             verdict = "[bold green]Real predictive power:[/] the reigning prophet beat the naive guess, and even the pessimistic end of the range is above zero."
         elif hi < 0:
@@ -471,6 +477,8 @@ class LabDisplay(Display):
             c.print(Text("No prophecies to reveal yet (the day after a call has to close first).", style="bright_black"))
         for target, rec in rounds:
             self.prophecy_round(leagues[target], rec, [])
+        for lg in leagues.values():
+            self.breeder_scoreboard(lg)
         for target, lg in leagues.items():
             yes, no, question = TARGETS[target]
             t = Table(title=f"{target.upper()} league · round {lg.round_no + 1} · day {lg.round_days}/5 · {question}",
@@ -480,9 +488,14 @@ class LabDisplay(Display):
             calls = calls_today.get(target, {})
             for p in sorted(lg.prophets, key=lambda p: p.accuracy, reverse=True):
                 n_yes = sum(calls.get(str(p.bot_id), []))
-                t.add_row(f"Bot #{p.bot_id}", p.role.title(), f"{p.accuracy:.1%}" if p.total else "-",
+                t.add_row(f"Bot #{p.bot_id}", _role(p.role), f"{p.accuracy:.1%}" if p.total else "-",
                           f"{p.life_accuracy:.1%}" if p.life_total else "-", f"{n_yes}/{len(symbols)} stocks")
             c.print(t)
+            ideas = [p for p in lg.prophets if p.note]
+            if ideas:
+                c.print(Panel("\n".join(f"[bold]Bot #{p.bot_id}[/]: {p.note}" for p in ideas),
+                              title=f"🧠 Claude's children in the {target} league - the idea behind each",
+                              border_style="magenta"))
             if lg.alpha_total:
                 c.print(Text(f"Reigning Alpha's live record: {lg.alpha_correct / lg.alpha_total:.2%} correct vs naive "
                              f"{lg.naive_correct / max(lg.naive_total, 1):.2%} over {lg.alpha_total:,} calls",
@@ -493,3 +506,44 @@ class LabDisplay(Display):
             c.print(Panel(f"Direction Alpha says UP tomorrow for {len(ups)} of {len(symbols)} stocks"
                           + (f": {', '.join(ups[:15])}{' …' if len(ups) > 15 else ''}" if ups else ""),
                           title=f"🔮 Tomorrow's prophecies (made with data through {today})", border_style="magenta"))
+
+    def breeder_scoreboard(self, lg) -> None:
+        """Who wins rounds: Claude's designs or blind random offspring? (per child slot, so it's fair)"""
+        entered = [h for h in lg.history if h.get("claude_children")]
+        if not entered:
+            return
+        # A round's contestants were born in the PREVIOUS round, so pair each result with the lineup it faced.
+        wins = {"CLAUDE": 0, "MUTANT": 0, "CROSSOVER": 0, "ALPHA": 0}
+        slots = {"CLAUDE": 0, "MUTANT": 0, "CROSSOVER": 0}
+        for prev, cur in zip(lg.history, lg.history[1:]):
+            n_c = prev.get("claude_children") or 0
+            if not n_c:
+                continue
+            slots["CLAUDE"] += n_c
+            slots["MUTANT"] += 4 - n_c
+            slots["CROSSOVER"] += 1
+            wins[cur["survivor_role"]] = wins.get(cur["survivor_role"], 0) + 1
+        judged = sum(wins.values())
+        if not judged:
+            self.console.print(Text(f"🧠 {lg.target.title()} league: Claude has designed children in {len(entered)} "
+                                    "round(s); the first verdict comes when that round ends.", style="magenta"))
+            return
+        parts = [f"Claude-designed {wins['CLAUDE']}/{slots['CLAUDE']} children won",
+                 f"random mutants {wins['MUTANT']}/{slots['MUTANT']}",
+                 f"crossovers {wins['CROSSOVER']}/{slots['CROSSOVER']}",
+                 f"Alpha defended {wins['ALPHA']}/{judged}"]
+        self.console.print(Text(f"🧠 Breeder scoreboard ({lg.target}, {judged} rounds): " + " · ".join(parts),
+                                style="magenta"))
+
+    def claude_breeder_status(self, breeder) -> None:
+        if breeder is None or not breeder.calls:
+            return
+        ok = breeder.calls - breeder.failures
+        msg = f"Claude designed children {ok}/{breeder.calls} times this run"
+        if breeder.failures:
+            msg += f" (fell back to random mutation {breeder.failures}x: {breeder.last_error})"
+        self.console.print(Text(msg, style="bright_black" if not breeder.failures else "yellow"))
+
+
+def _role(role: str) -> str:
+    return "Claude-bred" if role == "CLAUDE" else role.title()

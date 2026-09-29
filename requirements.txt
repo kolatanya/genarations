@@ -11,3 +11,9 @@ alpaca-py>=0.30
 # Terminal UI + charts
 rich>=13.7
 matplotlib>=3.8
+
+# Claude breeder (optional, Prophecy League)
+anthropic>=0.40
+
+# Speed (Lab simulator)
+numba>=0.60
