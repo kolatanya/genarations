@@ -80,6 +80,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     lab.add_argument("--target", choices=("direction", "volatility", "both"),
                      help="Forecaster: predict UP/DOWN, BIG/CALM moves, or both")
     lab.add_argument("--replay", type=int, help="Prophecy League: replay the last N trading days instead of live")
+    lab.add_argument("--no-claude", action="store_true",
+                     help="Prophecy League: don't let Claude design children (all random mutation)")
     parser.add_argument("--fast", action="store_true", help="No dramatic pauses (for testing / long runs)")
     args = parser.parse_args(argv)
     if args.generations is not None and args.generations < 1:
@@ -357,9 +359,12 @@ def run_forecast(args: argparse.Namespace, display: LabDisplay, interactive: boo
 def run_prophecy(args: argparse.Namespace, display: LabDisplay, interactive: bool) -> int:
     from rich.prompt import IntPrompt, Prompt
 
+    from lab.claude_breeder import make_breeder
     from lab.forecast import build_daily_features, load_daily
     from lab.prophecy import live_step, replay
 
+    breeder, status_msg = make_breeder(enabled=not args.no_claude)
+    (display.success if breeder else display.info)(status_msg)
     days = args.replay
     if interactive and days is None:
         pick = Prompt.ask("[1] LIVE: score yesterday's calls & predict tomorrow (run each evening)   "
@@ -374,10 +379,12 @@ def run_prophecy(args: argparse.Namespace, display: LabDisplay, interactive: boo
     if days:
         targets = ("direction", "volatility") if (args.target or "both") == "both" else (args.target,)
         for t in targets:
-            summary = replay(fs, answers, data.index, t, display, days=days, seed=args.seed)
+            summary = replay(fs, answers, data.index, t, display, days=days, seed=args.seed, breeder=breeder)
             display.prophecy_replay_summary(summary, fs)
+        display.claude_breeder_status(breeder)
         return EXIT_OK
-    live_step(fs, answers, data.index, data.symbols, display, seed=args.seed)
+    live_step(fs, answers, data.index, data.symbols, display, seed=args.seed, breeder=breeder)
+    display.claude_breeder_status(breeder)
     return EXIT_OK
 
 

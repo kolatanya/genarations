@@ -60,6 +60,7 @@ class Prophet:
     total: int = 0
     life_correct: int = 0       # whole life
     life_total: int = 0
+    note: str = ""              # Claude's reason for designing this child (empty for random offspring)
 
     @property
     def accuracy(self) -> float:
@@ -108,31 +109,40 @@ def founding_tree(target: str) -> gp.Node:
     return textbook_tree(target)
 
 
-def found_league(target: str, rng: random.Random, today: str) -> League:
+def found_league(target: str, rng: random.Random, today: str, breeder=None) -> League:
     league = League(target, [])
     alpha_tree = founding_tree(target)
     league.prophets.append(Prophet(league.new_id(), gp.to_json(alpha_tree), None, today, "ALPHA"))
-    league.prophets += _offspring(league, alpha_tree, alpha_tree, rng, today)
+    designed = breeder.design(target, alpha_tree, [], []) if breeder else None
+    league.prophets += _offspring(league, alpha_tree, alpha_tree, rng, today, designed)
     return league
 
 
-def _offspring(league: League, alpha: gp.Node, runner_up: gp.Node, rng: random.Random, today: str) -> list[Prophet]:
+def _offspring(league: League, alpha: gp.Node, runner_up: gp.Node, rng: random.Random, today: str,
+               designed: list[tuple[gp.Node, str]] | None = None) -> list[Prophet]:
+    """Five children: Claude's designs first (if any), then random mutants, and always one crossover.
+
+    At least one random mutant and the crossover are kept, so Claude's children always race a blind control."""
     kids, seen = [], {gp.key(alpha)}
     parent = league.prophets[0].bot_id if league.prophets else None
-    for i in range(LEAGUE_SIZE - 1):
-        tree = gp.crossover(alpha, runner_up, rng, MAX_DEPTH) if i == LEAGUE_SIZE - 2 else \
-            gp.mutate(alpha, rng, league.rate, MAX_DEPTH)
+    for tree, why in (designed or [])[:LEAGUE_SIZE - 3]:
+        if gp.key(tree) in seen:
+            continue
+        seen.add(gp.key(tree))
+        kids.append(Prophet(league.new_id(), gp.to_json(tree), parent, today, "CLAUDE", note=why))
+    while len(kids) < LEAGUE_SIZE - 1:
+        cross = len(kids) == LEAGUE_SIZE - 2
+        tree = gp.crossover(alpha, runner_up, rng, MAX_DEPTH) if cross else gp.mutate(alpha, rng, league.rate, MAX_DEPTH)
         for _ in range(5):
             if gp.key(tree) not in seen:
                 break
             tree = gp.mutate(tree, rng, max(league.rate, 0.2), MAX_DEPTH)
         seen.add(gp.key(tree))
-        kids.append(Prophet(league.new_id(), gp.to_json(tree), parent, today,
-                            "CROSSOVER" if i == LEAGUE_SIZE - 2 else "MUTANT"))
+        kids.append(Prophet(league.new_id(), gp.to_json(tree), parent, today, "CROSSOVER" if cross else "MUTANT"))
     return kids
 
 
-def judge_round(league: League, rng: random.Random, today: str, dates: str) -> dict:
+def judge_round(league: League, rng: random.Random, today: str, dates: str, breeder=None) -> dict:
     """Most correct calls survives; the rest are purged; the survivor has five children."""
     alpha = league.alpha
     ranked = sorted(league.prophets, key=lambda p: (p.accuracy, p is alpha), reverse=True)
@@ -146,6 +156,8 @@ def judge_round(league: League, rng: random.Random, today: str, dates: str) -> d
         "rule": survivor.tree,
     }
     survivor_tree, runner_tree = gp.from_json(survivor.tree), gp.from_json(runner_up.tree)
+    last_round = [{"accuracy": p.accuracy, "role": p.role, "rule": gp.describe(gp.from_json(p.tree), breeder.fs)}
+                  for p in ranked] if breeder is not None else []   # what Claude sees, captured before the purge
     # EXTINCTION: everyone except the survivor is deleted - verified with weak references
     tombstones = [weakref.ref(p) for p in league.prophets if p is not survivor]
     league.prophets = [survivor]
@@ -160,7 +172,9 @@ def judge_round(league: League, rng: random.Random, today: str, dates: str) -> d
                    else min(config.MUTATION_RATE_MAX, league.rate * config.MUTATION_STUCK_BOOST))
     survivor.role = "ALPHA"
     survivor.correct = survivor.total = 0
-    league.prophets += _offspring(league, survivor_tree, runner_tree, rng, today)
+    designed = breeder.design(league.target, survivor_tree, last_round, league.history) if breeder else None
+    league.prophets += _offspring(league, survivor_tree, runner_tree, rng, today, designed)
+    record["claude_children"] = sum(p.role == "CLAUDE" for p in league.prophets)
     for p in league.prophets[1:]:
         p.parent = survivor.bot_id
     league.round_no += 1
@@ -229,15 +243,17 @@ class ReplaySummary:
 
 
 def replay(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, target: str, display, *,
-           days: int = 250, seed: int | None = None, save_chart: bool = True) -> ReplaySummary:
+           days: int = 250, seed: int | None = None, save_chart: bool = True, breeder=None) -> ReplaySummary:
     rng = random.Random(seed)
     T = len(index)
     end = T - 1                                       # the last day has no "tomorrow" yet
     start = max(WARMUP_DAYS + 250, end - days)
     fs.fit_quantiles(WARMUP_DAYS, start)             # thresholds only from BEFORE the replay starts
     label, valid = _labels(ans, target)
+    if breeder is not None:
+        breeder.fs, breeder.ans, breeder.t = fs, ans, start
     with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
-        league = found_league(target, rng, str(index[start].date()))
+        league = found_league(target, rng, str(index[start].date()), breeder)
         display.prophecy_replay_intro(league, index[start].date(), index[end - 1].date(), days)
         alpha_daily, naive_daily, day_labels = [], [], []
         correct_matrix = []                          # per day: (alpha correct, naive correct, n) for the bootstrap
@@ -256,8 +272,10 @@ def replay(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, target: str, d
                 naive_daily.append(n_c / n)
                 day_labels.append(str(index[t].date()))
             if league.round_days >= ROUND_DAYS:
+                if breeder is not None:
+                    breeder.t = t + 1          # day t's answer is known at t+1's close, when the next calls are made
                 rec = judge_round(league, rng, str(index[t].date()),
-                                  f"{index[round_start].date()} → {index[t].date()}")
+                                  f"{index[round_start].date()} → {index[t].date()}", breeder)
                 display.prophecy_round(league, rec, naive_daily[-ROUND_DAYS:])
                 round_start = t + 1
     cm = np.array(correct_matrix, dtype=float)
@@ -320,12 +338,14 @@ def _league_from_json(d: dict) -> League:
 
 
 def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: list[str], display,
-              seed: int | None = None) -> dict:
+              seed: int | None = None, breeder=None) -> dict:
     """Score every call whose answer is now known, run selections, then make calls for the next day."""
     rng = random.Random(seed)
     last = _drop_unfinished_today(index)
     today = str(index[last].date())
     state = load_state()
+    if breeder is not None:
+        breeder.fs, breeder.ans, breeder.t = fs, ans, last
     with gp.schema(DAILY_NAMES, DAILY_BINARY, PLAIN):
         upgraded = state is not None and (state.get("symbols") != symbols or state.get("features") != DAILY_NAMES)
         if upgraded:
@@ -340,7 +360,7 @@ def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: li
             fs.fit_quantiles(WARMUP_DAYS, last - 60)
             state = {"founded": today, "symbols": symbols, "features": DAILY_NAMES,
                      "quantiles": fs.quantiles.tolist(), "pending": {},
-                     "leagues": {t: _league_to_json(found_league(t, rng, today)) for t in TARGETS},
+                     "leagues": {t: _league_to_json(found_league(t, rng, today, breeder)) for t in TARGETS},
                      "log": []}
             display.prophecy_live_founded(today)
         fs.quantiles = np.array(state["quantiles"])
@@ -364,7 +384,7 @@ def live_step(fs: FeatureSet, ans: Answers, index: pd.DatetimeIndex, symbols: li
                                 "naive": int((label[valid[:, i], i] == naive).sum()) / n if n else float("nan"),
                                 "alpha": lg.alpha.bot_id, "up_share": float(label[valid[:, i], i].mean()) if n else 0})
                 if lg.round_days >= ROUND_DAYS:
-                    rounds.append((target, judge_round(lg, rng, today, f"round ending {day}")))
+                    rounds.append((target, judge_round(lg, rng, today, f"round ending {day}", breeder)))
             del state["pending"][day]
 
         # 2) Prophesy: calls for the next trading day, based on today's close
