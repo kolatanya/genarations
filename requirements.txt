@@ -1,0 +1,13 @@
+# Core data + numerics
+pandas>=2.0
+numpy>=1.24
+
+# Market data (Mode 1: fast historical evolution)
+yfinance>=0.2.40
+
+# Broker (Mode 2: live paper execution) - only imported when Mode 2 runs
+alpaca-py>=0.30
+
+# Terminal UI + charts
+rich>=13.7
+matplotlib>=3.8

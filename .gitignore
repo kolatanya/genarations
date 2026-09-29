@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets
+.env
+
+# Generated at runtime
+data_cache/
+logs/
+checkpoints/*
+!checkpoints/.gitkeep
